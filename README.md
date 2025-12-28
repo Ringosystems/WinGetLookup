@@ -1,6 +1,6 @@
 # WinGetLookup
 
-[![PowerShell Gallery](https://img.shields.io/badge/PowerShell%20Gallery-v1.7.0-blue)](https://www.powershellgallery.com/packages/WinGetLookup)
+[![PowerShell Gallery](https://img.shields.io/badge/PowerShell%20Gallery-v1.7.1-blue)](https://www.powershellgallery.com/packages/WinGetLookup)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://docs.microsoft.com/powershell/)
 
