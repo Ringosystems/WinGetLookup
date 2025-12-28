@@ -9,7 +9,7 @@
     RootModule        = 'WinGetLookup.psm1'
 
     # Version number of this module
-    ModuleVersion     = '1.7.1'
+    ModuleVersion     = '1.8.0'
 
     # Supported PSEditions
     CompatiblePSEditions = @('Desktop', 'Core')
@@ -110,6 +110,18 @@
 
             # ReleaseNotes of this module
             ReleaseNotes = @'
+## Version 1.8.0 (December 28, 2025)
+### Bug Fixes
+- Fixed smart matching algorithm to prevent false positives
+- Packages must now contain the primary search word to be considered a match
+- Added minimum score threshold to filter out low-quality matches
+- Example: "TeamViewer 15" no longer incorrectly matches "115Chrome"
+
+### Improvements  
+- Improved scoring for exact name matches
+- Better handling of search terms with version numbers
+- More accurate matching for common software names
+
 ## Version 1.7.1 (December 28, 2025)
 ### Updates
 - Added MIT License file to module package

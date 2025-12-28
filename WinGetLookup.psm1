@@ -266,6 +266,9 @@ function Get-BestPackageMatch {
     <#
     .SYNOPSIS
         Scores and selects the best matching package from multiple API results.
+    .DESCRIPTION
+        Implements smart matching with quality thresholds to avoid false positives.
+        Requires packages to have meaningful relevance to the search term.
     #>
     param(
         [array]$Packages,
@@ -288,6 +291,21 @@ function Get-BestPackageMatch {
     $searchTermLower = $SearchTerm.ToLower()
     $publisherLower = if ($Publisher) { $Publisher.ToLower() } else { $null }
     
+    # Extract the primary word from search term for relevance check
+    # This prevents "TeamViewer 15" from matching "115Chrome"
+    # Filter out pure version numbers (all digits with dots) but keep things like "7-Zip"
+    $searchWords = $searchTermLower -split '\s+' | Where-Object { 
+        # Keep words that are NOT pure version numbers (e.g., keep "7-zip" but filter "24.09")
+        $_ -notmatch '^\d+(\.\d+)+$' -and $_.Length -gt 0
+    }
+    $primaryWord = if ($searchWords.Count -gt 0) { 
+        # Use the first meaningful word as the primary match requirement
+        $searchWords[0]
+    } else { 
+        # Fallback to full search term if no words remain
+        $searchTermLower 
+    }
+    
     foreach ($pkg in $Packages) {
         $score = 0
         $pkgId = $pkg.Id
@@ -297,6 +315,20 @@ function Get-BestPackageMatch {
         $pkgIdLower = if ($pkgId) { $pkgId.ToLower() } else { '' }
         $pkgNameLower = if ($pkgName) { $pkgName.ToLower() } else { '' }
         $pkgPublisherLower = if ($pkgPublisher) { $pkgPublisher.ToLower() } else { '' }
+        
+        # CRITICAL: Package must contain the primary search word to be considered
+        # This prevents completely unrelated packages from being returned
+        $hasPrimaryWord = ($pkgIdLower -like "*$primaryWord*") -or 
+                          ($pkgNameLower -like "*$primaryWord*") -or
+                          ($pkgPublisherLower -like "*$primaryWord*")
+        
+        if (-not $hasPrimaryWord) {
+            # Skip packages that don't contain the primary search word at all
+            continue
+        }
+        
+        # Base score for having the primary word
+        $score += 5
         
         # +100: Package ID = SearchTerm.SearchTerm pattern (e.g., "PuTTY.PuTTY", "7zip.7zip")
         $expectedId = "$searchTermLower.$searchTermLower"
@@ -318,9 +350,19 @@ function Get-BestPackageMatch {
             $score += 50
         }
         
+        # +30: Name equals primary word exactly (e.g., "TeamViewer" matches name "TeamViewer")
+        if ($pkgNameLower -eq $primaryWord) {
+            $score += 30
+        }
+        
         # +25: Name starts with search term
         if ($pkgNameLower.StartsWith($searchTermLower)) {
             $score += 25
+        }
+        
+        # +20: Name starts with primary word
+        if ($pkgNameLower.StartsWith($primaryWord)) {
+            $score += 20
         }
         
         # +15: Package ID starts with search term
@@ -328,7 +370,7 @@ function Get-BestPackageMatch {
             $score += 15
         }
         
-        # +10: Package ID contains search term (but not just in suffix)
+        # +10: Package ID contains search term in standard pattern
         if ($pkgIdLower -like "*.$searchTermLower" -or $pkgIdLower -like "$searchTermLower.*") {
             $score += 10
         }
@@ -341,9 +383,17 @@ function Get-BestPackageMatch {
         }
     }
     
-    # Return highest scoring package
-    $best = $scoredPackages | Sort-Object -Property Score -Descending | Select-Object -First 1
-    return $best.Package
+    # Require a minimum score to return a match (prevents low-quality matches)
+    $minScore = 10
+    $best = $scoredPackages | Where-Object { $_.Score -ge $minScore } | 
+            Sort-Object -Property Score -Descending | 
+            Select-Object -First 1
+    
+    if ($best) {
+        return $best.Package
+    }
+    
+    return $null
 }
 
 function Test-64BitIndicators {
