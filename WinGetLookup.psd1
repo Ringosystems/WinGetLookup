@@ -22,7 +22,7 @@
 
     # Company or vendor of this module
     CompanyName       = 'RingoSystems Heavy Industuries'
-winget install GitHub.cli
+
     # Copyright statement for this module
     Copyright         = '(c) 2025 Mark Ringo. MIT License.'
 
