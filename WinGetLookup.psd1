@@ -9,7 +9,7 @@
     RootModule        = 'WinGetLookup.psm1'
 
     # Version number of this module
-    ModuleVersion     = '1.7.0'
+    ModuleVersion     = '1.7.1'
 
     # Supported PSEditions
     CompatiblePSEditions = @('Desktop', 'Core')
@@ -110,6 +110,19 @@
 
             # ReleaseNotes of this module
             ReleaseNotes = @'
+## Version 1.7.1 (December 28, 2025)
+### Updates
+- Added MIT License file to module package
+- Added module icon for PSGallery display
+- Added comprehensive README documentation
+- Published to GitHub: https://github.com/Ringosystems/WinGetLookup
+- Updated ProjectUri and IconUri for PSGallery
+
+## Version 1.7.0 (December 27, 2025)
+### New Features
+- Added Initialize-WinGetPackageCache function for cache pre-warming
+- Performance improvements for batch operations
+
 ## Version 1.6.0 (December 26, 2025)
 ### New Features
 - Added Get-WinGet64BitPackageId function to handle separate 64-bit packages
