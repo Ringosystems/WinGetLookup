@@ -10,9 +10,11 @@
     
     Features:
     - Smart matching algorithm to find the best package match
+    - Primary word matching to prevent false positives
     - Publisher and PackageId filtering for precise matching
-    - 64-bit version detection
+    - 64-bit version detection and package ID conversion
     - Session-level caching to minimize API calls
+    - Cache pre-warming for batch operations
     
     SUPPORTED PLATFORMS:
     - Windows 10 version 1709 (build 16299) or later
@@ -27,9 +29,26 @@
 
 .NOTES
     Module Name: WinGetLookup
-    Author: Ringo
-    Version: 1.7.0
-    Date: December 27, 2025
+    Author: Mark Ringo
+    Company: RingoSystems
+    Version: 1.8.0
+    Date: December 28, 2025
+    License: MIT
+    Repository: https://github.com/Ringosystems/WinGetLookup
+    
+    VERSION HISTORY:
+    1.8.0 - Fixed smart matching to prevent false positives (e.g., "TeamViewer 15" no longer
+            matches "115Chrome"). Added primary word matching requirement and minimum score
+            threshold. Improved handling of version numbers in search terms.
+    1.7.1 - Added MIT License, icon, README, published to GitHub.
+    1.7.0 - Added Initialize-WinGetPackageCache for cache pre-warming.
+    1.6.0 - Added Get-WinGet64BitPackageId for 32-bit to 64-bit package conversion.
+    1.5.0 - Added Test-WinGet64BitAvailable for CLI-based x64 verification.
+    1.4.0 - Added Has64BitIndicator property to package info output.
+    1.3.0 - Added session-level caching with Clear-WinGetCache and Get-WinGetCacheStatistics.
+    1.2.0 - Added smart matching algorithm with publisher filtering.
+    1.1.0 - Added PackageId parameter for exact matching.
+    1.0.0 - Initial release with Test-WinGetPackage and Get-WinGetPackageInfo.
     
     This module does not require WinGet to be installed locally as it queries
     the winget.run web API directly.
