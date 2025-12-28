@@ -22,7 +22,7 @@
 
     # Company or vendor of this module
     CompanyName       = 'RingoSystems Heavy Industuries'
-
+winget install GitHub.cli
     # Copyright statement for this module
     Copyright         = '(c) 2025 Mark Ringo. MIT License.'
 
@@ -102,12 +102,11 @@
             LicenseUri   = 'https://opensource.org/licenses/MIT'
 
             # A URL to the main website for this project
-            ProjectUri   = ''
+            ProjectUri   = 'https://github.com/Ringosystems/WinGetLookup'
 
             # A URL to an icon representing this module
             # Note: For PSGallery, this must be a publicly accessible HTTPS URL
-            # Update this to point to your hosted icon (e.g., raw GitHub URL)
-            IconUri      = ''
+            IconUri      = 'https://raw.githubusercontent.com/Ringosystems/WinGetLookup/master/icon.png'
 
             # ReleaseNotes of this module
             ReleaseNotes = @'
