@@ -1,20 +1,25 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 
 <#
 .SYNOPSIS
-    WinGetLookup PowerShell Module - Query WinGet package availability.
+    WinGetLookup PowerShell Module - Query WinGet package availability with high fidelity.
 
 .DESCRIPTION
     This module provides functions to query the WinGet (Windows Package Manager) repository
     to determine if packages exist. It uses the winget.run API for package lookups.
     
     Features:
-    - Smart matching algorithm to find the best package match
-    - Primary word matching to prevent false positives
-    - Publisher and PackageId filtering for precise matching
-    - 64-bit version detection and package ID conversion
-    - Session-level caching to minimize API calls
-    - Cache pre-warming for batch operations
+    - API-based lookups with actual manifest data (not heuristics)
+    - True architecture detection from installer metadata (x86, x64, arm, arm64)
+    - InstallerType awareness (msi, exe, msix, inno, nullsoft, portable, etc.)
+    - Scope detection (user vs machine installation)
+    - Smart matching algorithm using API SearchScore + client-side validation
+    - Version comparison utilities following WinGet's comparison logic
+    - Publisher filtering at API level for efficiency
+    - Session-level caching with full parameter awareness
+    - Retry logic with exponential backoff for API resilience
+    - ProductCode/UpgradeCode correlation for MSI packages
+    - Pipeline support throughout
     
     SUPPORTED PLATFORMS:
     - Windows 10 version 1709 (build 16299) or later
@@ -24,22 +29,30 @@
     - PowerShell 5.1 (Windows PowerShell) and PowerShell 7+ (PowerShell Core)
     
     Note: The module's API-based functions work on any platform with internet access.
-    The WinGet CLI-based functions (Test-WinGet64BitAvailable) require WinGet to be
-    installed, which is only available on supported Windows versions.
+    The WinGet CLI-based functions require WinGet to be installed locally.
 
 .NOTES
     Module Name: WinGetLookup
     Author: Mark Ringo
     Company: RingoSystems
-    Version: 1.8.0
+    Version: 2.0.0-alpha1
     Date: December 28, 2025
     License: MIT
     Repository: https://github.com/Ringosystems/WinGetLookup
     
+    ⚠️ ALPHA RELEASE - APIs may change before final 2.0.0 release.
+    
     VERSION HISTORY:
-    1.8.0 - Fixed smart matching to prevent false positives (e.g., "TeamViewer 15" no longer
-            matches "115Chrome"). Added primary word matching requirement and minimum score
-            threshold. Improved handling of version numbers in search terms.
+    2.0.0-alpha1 - Major refactor for WinGet schema fidelity (ALPHA):
+            - True architecture detection from manifest Installers array
+            - InstallerType and Scope exposure in package info
+            - Version comparison utilities (Compare-WinGetVersion, Get-WinGetLatestVersion)
+            - API query optimization (preferContains, splitQuery, server-side publisher filter)
+            - Cache key includes all query parameters
+            - Retry logic with exponential backoff
+            - ProductCode search function for MSI correlation
+            - Hybrid scoring using API SearchScore + validation
+    1.8.0 - Fixed smart matching to prevent false positives
     1.7.1 - Added MIT License, icon, README, published to GitHub.
     1.7.0 - Added Initialize-WinGetPackageCache for cache pre-warming.
     1.6.0 - Added Get-WinGet64BitPackageId for 32-bit to 64-bit package conversion.
@@ -49,32 +62,40 @@
     1.2.0 - Added smart matching algorithm with publisher filtering.
     1.1.0 - Added PackageId parameter for exact matching.
     1.0.0 - Initial release with Test-WinGetPackage and Get-WinGetPackageInfo.
-    
-    This module does not require WinGet to be installed locally as it queries
-    the winget.run web API directly.
-    
-    API calls are cached for the duration of the PowerShell session to improve
-    performance when querying multiple similar applications.
 #>
 
 #region Private Variables
 $Script:WinGetApiBaseUrl = 'https://api.winget.run/v2'
 $Script:DefaultTimeout = 30
-$Script:DefaultTakeCount = 10  # Fetch multiple results for smart matching
+$Script:DefaultTakeCount = 10
+$Script:MaxRetries = 3
+$Script:BaseRetryDelayMs = 500
 
-# Session-level cache for API responses to minimize redundant calls
-# Key: URL-encoded search term, Value: API response (packages array)
+# Session-level cache for API responses
+# Key format: "searchterm|pub:publisher|id:packageid" (all lowercase)
 $Script:PackageCache = @{}
+$Script:ManifestCache = @{}  # Separate cache for full manifest lookups
 $Script:CacheHits = 0
 $Script:CacheMisses = 0
 
-# WinGet CLI path - cached at module load for performance
+# WinGet CLI path - cached at module load
 $Script:WinGetCliPath = $null
 $Script:WinGetCliAvailable = $false
+
+# Valid WinGet architecture values (per schema v1.12)
+$Script:ValidArchitectures = @('x86', 'x64', 'arm', 'arm64', 'neutral')
+
+# Valid WinGet installer types (per schema v1.12)
+$Script:ValidInstallerTypes = @(
+    'msix', 'msi', 'appx', 'exe', 'zip', 'inno', 'nullsoft', 
+    'wix', 'burn', 'pwa', 'portable', 'font'
+)
+
+# Valid scope values
+$Script:ValidScopes = @('user', 'machine')
 #endregion
 
 #region Module Initialization
-# Find and cache WinGet CLI path at module load (Improvement #1)
 function Initialize-WinGetCliPath {
     <#
     .SYNOPSIS
@@ -120,18 +141,263 @@ function Initialize-WinGetCliPath {
     $Script:WinGetCliAvailable = $false
 }
 
-# Initialize WinGet CLI path at module load
+# Initialize at module load
 Initialize-WinGetCliPath
 #endregion
 
-#region Private Functions
+#region Private Functions - API & Network
+
+function Invoke-WinGetApiWithRetry {
+    <#
+    .SYNOPSIS
+        Invokes a WinGet API call with retry logic and exponential backoff.
+    .DESCRIPTION
+        Handles transient failures (429 rate limit, 5xx server errors) with
+        automatic retry using exponential backoff.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+        
+        [int]$TimeoutSeconds = $Script:DefaultTimeout,
+        
+        [int]$MaxRetries = $Script:MaxRetries,
+        
+        [int]$BaseDelayMs = $Script:BaseRetryDelayMs
+    )
+    
+    $attempt = 0
+    $lastError = $null
+    
+    while ($attempt -lt $MaxRetries) {
+        $attempt++
+        
+        try {
+            $requestParams = @{
+                Uri             = $Uri
+                Method          = 'Get'
+                TimeoutSec      = $TimeoutSeconds
+                ErrorAction     = 'Stop'
+                UseBasicParsing = $true
+            }
+            
+            $response = Invoke-RestMethod @requestParams
+            return $response
+        }
+        catch {
+            $lastError = $_
+            $statusCode = $null
+            
+            # Try to extract HTTP status code
+            if ($_.Exception.Response) {
+                try {
+                    $statusCode = [int]$_.Exception.Response.StatusCode
+                }
+                catch {
+                    # Some PowerShell versions handle this differently
+                    if ($_.Exception.Response.StatusCode) {
+                        $statusCode = $_.Exception.Response.StatusCode.value__
+                    }
+                }
+            }
+            
+            # Determine if we should retry
+            $retryableStatusCodes = @(429, 500, 502, 503, 504)
+            $isRetryable = ($statusCode -and $statusCode -in $retryableStatusCodes) -or 
+                           ($_.Exception -is [System.Net.WebException] -and 
+                            $_.Exception.Status -in @('Timeout', 'ConnectFailure', 'ReceiveFailure'))
+            
+            if ($isRetryable -and $attempt -lt $MaxRetries) {
+                $delay = $BaseDelayMs * [Math]::Pow(2, $attempt - 1)
+                Write-Verbose "API request failed (attempt $attempt/$MaxRetries), retrying in $delay ms. Status: $statusCode"
+                Start-Sleep -Milliseconds $delay
+                continue
+            }
+            
+            # Not retryable or max retries exceeded
+            throw
+        }
+    }
+    
+    # Should not reach here, but just in case
+    throw $lastError
+}
+
+function Get-CacheKey {
+    <#
+    .SYNOPSIS
+        Generates a consistent cache key from search parameters.
+    .DESCRIPTION
+        Includes all query parameters in the cache key to prevent
+        returning stale filtered results.
+    #>
+    param(
+        [string]$SearchTerm,
+        [string]$Publisher,
+        [string]$PackageId
+    )
+    
+    $termPart = if ($SearchTerm) { $SearchTerm.ToLowerInvariant().Trim() } else { '' }
+    $pubPart = if ($Publisher) { $Publisher.ToLowerInvariant().Trim() } else { '' }
+    $idPart = if ($PackageId) { $PackageId.ToLowerInvariant().Trim() } else { '' }
+    
+    return "$termPart|pub:$pubPart|id:$idPart"
+}
+
+function Get-CachedApiResponse {
+    <#
+    .SYNOPSIS
+        Retrieves cached API response or makes a new API call with caching.
+    .DESCRIPTION
+        Implements session-level caching with full parameter awareness.
+        Uses optimized API query parameters for better results.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$SearchTerm,
+        
+        [string]$Publisher,
+        
+        [string]$PackageId,
+        
+        [int]$TimeoutSeconds = $Script:DefaultTimeout
+    )
+    
+    # Generate cache key including all parameters
+    $cacheKey = Get-CacheKey -SearchTerm $SearchTerm -Publisher $Publisher -PackageId $PackageId
+    
+    # Check cache
+    if ($Script:PackageCache.ContainsKey($cacheKey)) {
+        $Script:CacheHits++
+        Write-Verbose "Cache HIT for key '$cacheKey' (Total hits: $($Script:CacheHits))"
+        return $Script:PackageCache[$cacheKey]
+    }
+    
+    # Cache miss
+    $Script:CacheMisses++
+    Write-Verbose "Cache MISS for key '$cacheKey' - calling API (Total misses: $($Script:CacheMisses))"
+    
+    try {
+        # Build optimized query parameters
+        $queryParams = [System.Collections.ArrayList]@()
+        
+        # Primary search term
+        $encodedName = [System.Uri]::EscapeDataString($SearchTerm)
+        [void]$queryParams.Add("name=$encodedName")
+        
+        # Server-side publisher filter (more efficient than client-side)
+        if ($Publisher) {
+            $encodedPublisher = [System.Uri]::EscapeDataString($Publisher)
+            [void]$queryParams.Add("publisher=$encodedPublisher")
+        }
+        
+        # Optimized search parameters
+        [void]$queryParams.Add("ensureContains=true")   # Require term in results
+        [void]$queryParams.Add("preferContains=true")   # Let API rank by match quality
+        [void]$queryParams.Add("splitQuery=true")       # Handle multi-word names
+        [void]$queryParams.Add("take=$($Script:DefaultTakeCount)")
+        
+        $apiUrl = "$Script:WinGetApiBaseUrl/packages?" + ($queryParams -join '&')
+        Write-Verbose "API URL: $apiUrl"
+        
+        # Make request with retry logic
+        $response = Invoke-WinGetApiWithRetry -Uri $apiUrl -TimeoutSeconds $TimeoutSeconds
+        
+        # Parse response
+        $packages = $null
+        
+        if ($response -is [string]) {
+            $parsed = $response | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($parsed -and $parsed.Packages) {
+                $packages = $parsed.Packages
+            }
+        }
+        elseif ($response.Packages) {
+            $packages = $response.Packages
+        }
+        
+        # Ensure we have an array
+        if ($null -eq $packages) {
+            $packages = @()
+        }
+        elseif ($packages -isnot [array]) {
+            $packages = @($packages)
+        }
+        
+        # Cache the result
+        $Script:PackageCache[$cacheKey] = $packages
+        
+        return $packages
+    }
+    catch {
+        Write-Verbose "API error for '$SearchTerm': $($_.Exception.Message)"
+        # Cache empty result to avoid repeated failed calls
+        $Script:PackageCache[$cacheKey] = @()
+        return @()
+    }
+}
+
+function Get-PackageManifestDetails {
+    <#
+    .SYNOPSIS
+        Fetches full manifest details for a specific package.
+    .DESCRIPTION
+        Retrieves the complete package data including Installers array
+        with Architecture, InstallerType, and Scope information.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageId,
+        
+        [int]$TimeoutSeconds = $Script:DefaultTimeout
+    )
+    
+    # Check manifest cache
+    $cacheKey = $PackageId.ToLowerInvariant()
+    if ($Script:ManifestCache.ContainsKey($cacheKey)) {
+        Write-Verbose "Manifest cache HIT for '$PackageId'"
+        return $Script:ManifestCache[$cacheKey]
+    }
+    
+    Write-Verbose "Fetching full manifest for: $PackageId"
+    
+    try {
+        # Parse package ID into Publisher and Package parts
+        # Format is typically: Publisher.PackageName or Publisher.Sub.PackageName
+        $parts = $PackageId -split '\.', 2
+        
+        if ($parts.Count -lt 2) {
+            Write-Verbose "Invalid package ID format: $PackageId"
+            return $null
+        }
+        
+        $publisher = $parts[0]
+        $package = $parts[1]
+        
+        # URL encode the parts
+        $encodedPublisher = [System.Uri]::EscapeDataString($publisher)
+        $encodedPackage = [System.Uri]::EscapeDataString($package)
+        
+        $manifestUrl = "$Script:WinGetApiBaseUrl/packages/$encodedPublisher/$encodedPackage"
+        Write-Verbose "Manifest URL: $manifestUrl"
+        
+        $response = Invoke-WinGetApiWithRetry -Uri $manifestUrl -TimeoutSeconds $TimeoutSeconds
+        
+        # Cache and return
+        $Script:ManifestCache[$cacheKey] = $response
+        return $response
+    }
+    catch {
+        Write-Verbose "Failed to fetch manifest for $PackageId : $($_.Exception.Message)"
+        $Script:ManifestCache[$cacheKey] = $null
+        return $null
+    }
+}
 
 function Invoke-WinGetCliCommand {
     <#
     .SYNOPSIS
         Executes a WinGet CLI command with timeout and proper output handling.
-    .DESCRIPTION
-        Reusable helper for running WinGet commands with consistent error handling.
     #>
     param(
         [Parameter(Mandatory)]
@@ -164,13 +430,13 @@ function Invoke-WinGetCliCommand {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $psi
         
-        $process.Start() | Out-Null
+        [void]$process.Start()
         
         # Read output asynchronously
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         
-        # Wait for process with timeout
+        # Wait with timeout
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $process.Kill()
             return @{
@@ -202,92 +468,18 @@ function Invoke-WinGetCliCommand {
         }
     }
 }
+#endregion
 
-function Get-CachedApiResponse {
-    <#
-    .SYNOPSIS
-        Retrieves cached API response or makes a new API call and caches the result.
-    
-    .DESCRIPTION
-        Implements session-level caching to reduce redundant API calls.
-        Cache persists for the lifetime of the PowerShell session or until
-        Clear-WinGetCache is called.
-    #>
-    param(
-        [Parameter(Mandatory)]
-        [string]$SearchTerm,
-        
-        [int]$TimeoutSeconds = $Script:DefaultTimeout
-    )
-    
-    # Create cache key from search term
-    $cacheKey = $SearchTerm.ToLowerInvariant().Trim()
-    
-    # Check if we have a cached response
-    if ($Script:PackageCache.ContainsKey($cacheKey)) {
-        $Script:CacheHits++
-        Write-Verbose "Cache HIT for '$SearchTerm' (Total hits: $($Script:CacheHits))"
-        return $Script:PackageCache[$cacheKey]
-    }
-    
-    # Cache miss - make API call
-    $Script:CacheMisses++
-    Write-Verbose "Cache MISS for '$SearchTerm' - calling API (Total misses: $($Script:CacheMisses))"
-    
-    try {
-        # URL encode the search term
-        $encodedName = [System.Uri]::EscapeDataString($SearchTerm)
-        
-        # Build the API URL
-        $takeCount = $Script:DefaultTakeCount
-        $apiUrl = "$Script:WinGetApiBaseUrl/packages?name=$encodedName&ensureContains=true&take=$takeCount"
-        
-        Write-Verbose "API URL: $apiUrl"
-        
-        # Configure request parameters
-        $requestParams = @{
-            Uri             = $apiUrl
-            Method          = 'Get'
-            TimeoutSec      = $TimeoutSeconds
-            ErrorAction     = 'Stop'
-            UseBasicParsing = $true
-        }
-        
-        # Make the API request
-        $response = Invoke-RestMethod @requestParams
-        
-        # Parse response
-        $packages = $null
-        
-        if ($response -is [string]) {
-            $parsed = $response | ConvertFrom-Json -AsHashtable -ErrorAction SilentlyContinue
-            if ($parsed -and $parsed.Packages) {
-                $packages = $parsed.Packages
-            }
-        } elseif ($response.Packages) {
-            $packages = $response.Packages
-        }
-        
-        # Cache the result (even if empty - avoids repeated failed lookups)
-        $Script:PackageCache[$cacheKey] = $packages
-        
-        return $packages
-    }
-    catch {
-        Write-Verbose "API error for '$SearchTerm': $($_.Exception.Message)"
-        # Cache the failure as empty result to avoid repeated failed calls
-        $Script:PackageCache[$cacheKey] = @()
-        return @()
-    }
-}
+#region Private Functions - Matching & Parsing
 
 function Get-BestPackageMatch {
     <#
     .SYNOPSIS
-        Scores and selects the best matching package from multiple API results.
+        Selects the best matching package using hybrid API + client scoring.
     .DESCRIPTION
-        Implements smart matching with quality thresholds to avoid false positives.
-        Requires packages to have meaningful relevance to the search term.
+        Uses API's SearchScore as primary ranking, then applies client-side
+        validation to ensure relevance. Requires packages to contain the
+        primary search word to prevent false positives.
     #>
     param(
         [array]$Packages,
@@ -300,32 +492,70 @@ function Get-BestPackageMatch {
         return $null
     }
     
-    # If PackageId is specified, find exact match
+    # Exact PackageId match takes absolute priority
     if ($PackageId) {
         $exactMatch = $Packages | Where-Object { $_.Id -eq $PackageId } | Select-Object -First 1
-        return $exactMatch
+        if ($exactMatch) {
+            Write-Verbose "Exact PackageId match found: $PackageId"
+            return $exactMatch
+        }
+        Write-Verbose "PackageId '$PackageId' not found in results"
+        return $null
     }
     
-    $scoredPackages = @()
     $searchTermLower = $SearchTerm.ToLower()
     $publisherLower = if ($Publisher) { $Publisher.ToLower() } else { $null }
     
-    # Extract the primary word from search term for relevance check
-    # This prevents "TeamViewer 15" from matching "115Chrome"
-    # Filter out pure version numbers (all digits with dots) but keep things like "7-Zip"
+    # Extract primary word (filter out pure version numbers)
     $searchWords = $searchTermLower -split '\s+' | Where-Object { 
-        # Keep words that are NOT pure version numbers (e.g., keep "7-zip" but filter "24.09")
         $_ -notmatch '^\d+(\.\d+)+$' -and $_.Length -gt 0
     }
-    $primaryWord = if ($searchWords.Count -gt 0) { 
-        # Use the first meaningful word as the primary match requirement
-        $searchWords[0]
-    } else { 
-        # Fallback to full search term if no words remain
-        $searchTermLower 
-    }
+    $primaryWord = if ($searchWords.Count -gt 0) { $searchWords[0] } else { $searchTermLower }
+    
+    Write-Verbose "Primary search word: '$primaryWord'"
+    
+    # First pass: filter to only packages containing primary word
+    $validPackages = @()
     
     foreach ($pkg in $Packages) {
+        $pkgId = $pkg.Id
+        $pkgName = if ($pkg.Latest) { $pkg.Latest.Name } else { $pkg.Name }
+        $pkgPublisher = if ($pkg.Latest) { $pkg.Latest.Publisher } else { $pkg.Publisher }
+        
+        $pkgIdLower = if ($pkgId) { $pkgId.ToLower() } else { '' }
+        $pkgNameLower = if ($pkgName) { $pkgName.ToLower() } else { '' }
+        $pkgPublisherLower = if ($pkgPublisher) { $pkgPublisher.ToLower() } else { '' }
+        
+        # Must contain primary word somewhere
+        $hasPrimaryWord = ($pkgIdLower -like "*$primaryWord*") -or 
+                          ($pkgNameLower -like "*$primaryWord*") -or
+                          ($pkgPublisherLower -like "*$primaryWord*")
+        
+        if (-not $hasPrimaryWord) {
+            continue
+        }
+        
+        # Publisher filter validation (if specified and not already filtered by API)
+        if ($publisherLower) {
+            $publisherMatch = ($pkgPublisherLower -eq $publisherLower) -or 
+                              ($pkgPublisherLower -like "*$publisherLower*")
+            if (-not $publisherMatch) {
+                continue
+            }
+        }
+        
+        $validPackages += $pkg
+    }
+    
+    if ($validPackages.Count -eq 0) {
+        Write-Verbose "No packages passed validation filters"
+        return $null
+    }
+    
+    # Second pass: score and rank
+    $scoredPackages = @()
+    
+    foreach ($pkg in $validPackages) {
         $score = 0
         $pkgId = $pkg.Id
         $pkgName = if ($pkg.Latest) { $pkg.Latest.Name } else { $pkg.Name }
@@ -335,41 +565,31 @@ function Get-BestPackageMatch {
         $pkgNameLower = if ($pkgName) { $pkgName.ToLower() } else { '' }
         $pkgPublisherLower = if ($pkgPublisher) { $pkgPublisher.ToLower() } else { '' }
         
-        # CRITICAL: Package must contain the primary search word to be considered
-        # This prevents completely unrelated packages from being returned
-        $hasPrimaryWord = ($pkgIdLower -like "*$primaryWord*") -or 
-                          ($pkgNameLower -like "*$primaryWord*") -or
-                          ($pkgPublisherLower -like "*$primaryWord*")
-        
-        if (-not $hasPrimaryWord) {
-            # Skip packages that don't contain the primary search word at all
-            continue
+        # Use API's SearchScore if available (0-100 scale typically)
+        if ($pkg.SearchScore) {
+            $score += [int]($pkg.SearchScore * 0.5)  # Weight API score at 50%
         }
         
-        # Base score for having the primary word
-        $score += 5
+        # Base score for passing validation
+        $score += 10
         
-        # +100: Package ID = SearchTerm.SearchTerm pattern (e.g., "PuTTY.PuTTY", "7zip.7zip")
+        # +100: Package ID = SearchTerm.SearchTerm pattern
         $expectedId = "$searchTermLower.$searchTermLower"
         if ($pkgIdLower -eq $expectedId) {
             $score += 100
         }
         
-        # +75: Publisher matches (when -Publisher specified)
-        if ($publisherLower -and $pkgPublisherLower) {
-            if ($pkgPublisherLower -eq $publisherLower) {
-                $score += 75
-            } elseif ($pkgPublisherLower -like "*$publisherLower*") {
-                $score += 40
-            }
+        # +75: Exact publisher match
+        if ($publisherLower -and $pkgPublisherLower -eq $publisherLower) {
+            $score += 75
         }
         
-        # +50: Exact name match (case-insensitive)
+        # +50: Exact name match
         if ($pkgNameLower -eq $searchTermLower) {
             $score += 50
         }
         
-        # +30: Name equals primary word exactly (e.g., "TeamViewer" matches name "TeamViewer")
+        # +30: Name equals primary word
         if ($pkgNameLower -eq $primaryWord) {
             $score += 30
         }
@@ -402,111 +622,310 @@ function Get-BestPackageMatch {
         }
     }
     
-    # Require a minimum score to return a match (prevents low-quality matches)
-    $minScore = 10
-    $best = $scoredPackages | Where-Object { $_.Score -ge $minScore } | 
+    # Require minimum score
+    $minScore = 15
+    $best = $scoredPackages | 
+            Where-Object { $_.Score -ge $minScore } | 
             Sort-Object -Property Score -Descending | 
             Select-Object -First 1
     
     if ($best) {
+        Write-Verbose "Best match: $($best.Name) ($($best.Id)) with score $($best.Score)"
         return $best.Package
     }
     
     return $null
 }
 
-function Test-64BitIndicators {
+function Get-InstallerMetadata {
     <#
     .SYNOPSIS
-        Checks if package has 64-bit indicators in its ID, name, or tags.
+        Extracts installer metadata (architectures, types, scopes) from package data.
+    .DESCRIPTION
+        Parses the Installers array from package manifest to extract
+        all available architectures, installer types, and scopes.
     #>
     param(
-        [string]$PackageId,
-        [string]$PackageName,
-        [array]$Tags
+        [Parameter(Mandatory)]
+        $Package
     )
     
-    # Check package ID for 64-bit indicators
-    if ($PackageId -match '64[-.]?bit|x64|win64|\.64|amd64') {
-        return $true
+    $result = @{
+        Architectures  = @()
+        InstallerTypes = @()
+        Scopes         = @()
+        Has64Bit       = $false
+        HasArm64       = $false
+        Installers     = @()
     }
     
-    # Check package name for 64-bit indicators
-    if ($PackageName -match '64[-\s]?bit|x64|\(64\)|win64|amd64') {
-        return $true
+    # Try to get installers from Latest property
+    $installers = $null
+    if ($Package.Latest -and $Package.Latest.Installers) {
+        $installers = $Package.Latest.Installers
+    }
+    elseif ($Package.Installers) {
+        $installers = $Package.Installers
     }
     
-    # Check tags for 64-bit/x64 indicators
-    if ($Tags) {
-        foreach ($tag in $Tags) {
-            if ($tag -match '^(64-?bit|x64|amd64|win64)$') {
-                return $true
+    if (-not $installers -or $installers.Count -eq 0) {
+        Write-Verbose "No installer metadata found in package"
+        return $result
+    }
+    
+    $result.Installers = $installers
+    
+    foreach ($installer in $installers) {
+        # Architecture
+        if ($installer.Architecture) {
+            $arch = $installer.Architecture.ToLower()
+            if ($arch -notin $result.Architectures) {
+                $result.Architectures += $arch
+            }
+            if ($arch -eq 'x64') {
+                $result.Has64Bit = $true
+            }
+            if ($arch -eq 'arm64') {
+                $result.HasArm64 = $true
+            }
+        }
+        
+        # Installer Type
+        if ($installer.InstallerType) {
+            $type = $installer.InstallerType.ToLower()
+            if ($type -notin $result.InstallerTypes) {
+                $result.InstallerTypes += $type
+            }
+        }
+        
+        # Scope
+        if ($installer.Scope) {
+            $scope = $installer.Scope.ToLower()
+            if ($scope -notin $result.Scopes) {
+                $result.Scopes += $scope
             }
         }
     }
     
-    # Many modern apps default to 64-bit, check for known 64-bit package patterns
-    # These are well-known packages that provide 64-bit versions
-    $known64BitPatterns = @(
-        '7zip\.7zip',
-        'Notepad\+\+\.Notepad\+\+',
-        'VideoLAN\.VLC',
-        'Mozilla\.Firefox',
-        'Google\.Chrome',
-        'Adobe\.Acrobat\.Reader\.64-bit',
-        'Microsoft\.VisualStudioCode',
-        'Git\.Git',
-        'Python\.Python',
-        'OpenJS\.NodeJS',
-        'voidtools\.Everything',
-        'WinSCP\.WinSCP',
-        'PuTTY\.PuTTY',
-        'Bitwarden\.Bitwarden',
-        'KeePassXCTeam\.KeePassXC'
+    # Default scope if none specified
+    if ($result.Scopes.Count -eq 0) {
+        $result.Scopes = @('machine')
+    }
+    
+    return $result
+}
+
+function Test-64BitFromManifest {
+    <#
+    .SYNOPSIS
+        Checks for x64/arm64 architecture using actual manifest data.
+    .DESCRIPTION
+        Queries the package manifest to check for 64-bit installer availability.
+        This is authoritative, not heuristic-based.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$PackageId,
+        
+        [int]$TimeoutSeconds = 15
     )
     
-    foreach ($pattern in $known64BitPatterns) {
-        if ($PackageId -match $pattern) {
-            return $true
+    # First try to get from cached search results
+    foreach ($cacheEntry in $Script:PackageCache.Values) {
+        if ($cacheEntry -is [array]) {
+            $pkg = $cacheEntry | Where-Object { $_.Id -eq $PackageId } | Select-Object -First 1
+            if ($pkg) {
+                $metadata = Get-InstallerMetadata -Package $pkg
+                if ($metadata.Has64Bit -or $metadata.HasArm64) {
+                    return $true
+                }
+            }
         }
+    }
+    
+    # Fetch full manifest if not in cache
+    $manifest = Get-PackageManifestDetails -PackageId $PackageId -TimeoutSeconds $TimeoutSeconds
+    
+    if ($manifest) {
+        $metadata = Get-InstallerMetadata -Package $manifest
+        return ($metadata.Has64Bit -or $metadata.HasArm64)
     }
     
     return $false
 }
+#endregion
 
-function Test-64BitPackageAvailable {
+#region Public Functions - Version Comparison
+
+function Compare-WinGetVersion {
     <#
     .SYNOPSIS
-        Parses API response string to check for 64-bit package availability.
+        Compares two WinGet-style version strings.
+
+    .DESCRIPTION
+        Compares version strings following WinGet's version comparison logic.
+        Versions are split on dots and compared segment-by-segment.
+        Numeric segments are compared numerically; string segments use
+        ordinal comparison.
+        
+        WinGet supports various version formats:
+        - Standard: 1.0, 1.0.0, 1.0.0.0
+        - Date-based: 2024.01.15
+        - Mixed: 24.09, 1.0-beta
+
+    .PARAMETER Version1
+        The first version string to compare.
+
+    .PARAMETER Version2
+        The second version string to compare.
+
+    .OUTPUTS
+        System.Int32
+        Returns -1 if Version1 < Version2
+        Returns  0 if Version1 = Version2
+        Returns  1 if Version1 > Version2
+
+    .EXAMPLE
+        Compare-WinGetVersion -Version1 "1.0.0" -Version2 "1.0.1"
+        Returns -1 (Version1 is older)
+
+    .EXAMPLE
+        Compare-WinGetVersion -Version1 "2.0" -Version2 "1.9.9"
+        Returns 1 (Version1 is newer)
+
+    .EXAMPLE
+        Compare-WinGetVersion "24.09" "24.10"
+        Returns -1 (Version1 is older)
+
+    .NOTES
+        Author: Mark Ringo
+        Version: 2.0.0
     #>
+    [CmdletBinding()]
+    [OutputType([int])]
     param(
-        [string]$ResponseString
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Version1,
+        
+        [Parameter(Mandatory, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Version2
     )
     
-    # Extract package ID from response
-    $packageId = $null
-    $packageName = $null
-    $tags = @()
+    # Normalize: remove common prefixes
+    $v1Clean = $Version1 -replace '^[vV]', ''
+    $v2Clean = $Version2 -replace '^[vV]', ''
     
-    if ($ResponseString -match '"Id"\s*:\s*"([^"]+)"') {
-        $packageId = $Matches[1]
+    # Split on dots
+    $v1Parts = $v1Clean -split '\.'
+    $v2Parts = $v2Clean -split '\.'
+    
+    $maxLength = [Math]::Max($v1Parts.Count, $v2Parts.Count)
+    
+    for ($i = 0; $i -lt $maxLength; $i++) {
+        $p1 = if ($i -lt $v1Parts.Count) { $v1Parts[$i] } else { '0' }
+        $p2 = if ($i -lt $v2Parts.Count) { $v2Parts[$i] } else { '0' }
+        
+        # Try numeric comparison first
+        $num1 = 0
+        $num2 = 0
+        $isNum1 = [int]::TryParse($p1, [ref]$num1)
+        $isNum2 = [int]::TryParse($p2, [ref]$num2)
+        
+        if ($isNum1 -and $isNum2) {
+            # Both are numeric
+            if ($num1 -lt $num2) { return -1 }
+            if ($num1 -gt $num2) { return 1 }
+        }
+        else {
+            # String comparison (handles mixed like "1.0-beta")
+            $cmp = [string]::Compare($p1, $p2, [StringComparison]::OrdinalIgnoreCase)
+            if ($cmp -ne 0) { return $cmp }
+        }
     }
     
-    if ($ResponseString -match '"Name"\s*:\s*"([^"]+)"') {
-        $packageName = $Matches[1]
+    return 0
+}
+
+function Get-WinGetLatestVersion {
+    <#
+    .SYNOPSIS
+        Returns the latest version from a list of WinGet version strings.
+
+    .DESCRIPTION
+        Sorts version strings using WinGet's comparison logic and returns
+        the highest (latest) version.
+
+    .PARAMETER Versions
+        Array of version strings to evaluate.
+
+    .OUTPUTS
+        System.String
+        The latest (highest) version string, or $null if input is empty.
+
+    .EXAMPLE
+        Get-WinGetLatestVersion -Versions @("1.0", "2.0", "1.5")
+        Returns "2.0"
+
+    .EXAMPLE
+        @("24.09", "24.10", "24.08") | Get-WinGetLatestVersion
+        Returns "24.10"
+
+    .NOTES
+        Author: Mark Ringo
+        Version: 2.0.0
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
+        [AllowEmptyCollection()]
+        [string[]]$Versions
+    )
+    
+    begin {
+        $allVersions = @()
     }
     
-    # Extract tags array
-    if ($ResponseString -match '"Tags"\s*:\s*\[([^\]]*)\]') {
-        $tagsString = $Matches[1]
-        $tags = [regex]::Matches($tagsString, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+    process {
+        $allVersions += $Versions
     }
     
-    return Test-64BitIndicators -PackageId $packageId -PackageName $packageName -Tags $tags
+    end {
+        if ($allVersions.Count -eq 0) {
+            return $null
+        }
+        
+        if ($allVersions.Count -eq 1) {
+            return $allVersions[0]
+        }
+        
+        # Sort using our comparison function
+        $sorted = $allVersions | Sort-Object -Property @{
+            Expression = {
+                # Create a sortable key
+                $parts = ($_ -replace '^[vV]', '') -split '\.'
+                $key = ''
+                foreach ($part in $parts) {
+                    $num = 0
+                    if ([int]::TryParse($part, [ref]$num)) {
+                        $key += $num.ToString('D10')
+                    }
+                    else {
+                        $key += $part.PadRight(10)
+                    }
+                }
+                $key
+            }
+        } -Descending
+        
+        return $sorted | Select-Object -First 1
+    }
 }
 #endregion
 
-#region Public Functions
+#region Public Functions - Package Lookup
 
 function Test-WinGetPackage {
     <#
@@ -517,188 +936,87 @@ function Test-WinGetPackage {
         Queries the winget.run API to determine if a package with the specified 
         display name exists in the Windows Package Manager (WinGet) repository.
         
-        Uses smart matching to find the best package match when multiple results
-        are returned. Supports filtering by publisher for precise matching.
-        
-        This function is useful for:
-        - Validating if an application can be installed via WinGet
-        - Checking package availability before automation scripts
-        - Inventory assessment for application deployment planning
+        Uses smart matching with API-level and client-side filtering.
+        Can verify 64-bit availability using actual manifest architecture data.
 
     .PARAMETER DisplayName
         The display name of the application to search for.
-        This should be the common name of the application (e.g., "Notepad++", "7-Zip", "VLC").
-        The search is case-insensitive and uses partial matching.
 
     .PARAMETER Publisher
-        Optional publisher name to filter results for more precise matching.
-        Useful when multiple packages share similar names.
-        Example: -Publisher "Simon Tatham" to specifically match PuTTY.
+        Optional publisher name to filter results (applied at API level).
 
     .PARAMETER PackageId
         Optional exact WinGet package ID for direct matching.
-        When specified, DisplayName is still used for the search but only the
-        package with this exact ID will be considered a match.
-        Example: -PackageId "PuTTY.PuTTY"
 
     .PARAMETER Require64Bit
-        When specified, returns 1 only if a 64-bit version of the package is available.
-        The function checks if the package ID or name contains '64', 'x64', or 'win64' indicators,
-        or if the package has x64 architecture tags.
+        When specified, returns 1 only if an x64 or arm64 installer is available.
+        Uses actual manifest data, not heuristics.
 
     .PARAMETER TimeoutSeconds
-        The timeout in seconds for the API request.
-        Default is 30 seconds.
+        The timeout in seconds for the API request. Default is 30.
 
     .OUTPUTS
         System.Int32
-        Returns 1 if the package is found in the WinGet repository (and meets all requirements).
-        Returns 0 if the package is not found, doesn't match criteria, or an error occurs.
+        Returns 1 if the package is found (and meets requirements).
+        Returns 0 if not found or requirements not met.
 
     .EXAMPLE
         Test-WinGetPackage -DisplayName "Visual Studio Code"
-        
-        Returns 1 if Visual Studio Code is available in WinGet, 0 otherwise.
-
-    .EXAMPLE
-        Test-WinGetPackage "Notepad++"
-        
-        Uses positional parameter to check if Notepad++ is available.
         Returns 1 if found.
 
     .EXAMPLE
+        Test-WinGetPackage -DisplayName "7-Zip" -Require64Bit
+        Returns 1 only if 7-Zip has an x64 installer.
+
+    .EXAMPLE
         Test-WinGetPackage -DisplayName "PuTTY" -Publisher "Simon Tatham"
-        
-        Returns 1 only if PuTTY by Simon Tatham is found (not MTPuTTY or other variants).
-
-    .EXAMPLE
-        Test-WinGetPackage -DisplayName "PuTTY" -PackageId "PuTTY.PuTTY"
-        
-        Returns 1 only if the exact package ID "PuTTY.PuTTY" is found.
-
-    .EXAMPLE
-        $exists = Test-WinGetPackage "7-Zip"
-        if ($exists -eq 1) {
-            Write-Host "7-Zip is available for installation via WinGet"
-        }
-        
-        Demonstrates using the return value in conditional logic.
-
-    .EXAMPLE
-        @("Notepad++", "7-Zip", "VLC", "FakeApp123") | ForEach-Object {
-            [PSCustomObject]@{
-                Application = $_
-                Available   = Test-WinGetPackage $_
-            }
-        }
-        
-        Checks multiple applications and creates a report of availability.
-
-    .EXAMPLE
-        Test-WinGetPackage -DisplayName "Adobe Acrobat Reader" -Require64Bit
-        
-        Returns 1 only if a 64-bit version of Adobe Acrobat Reader is available in WinGet.
-
-    .EXAMPLE
-        $has64Bit = Test-WinGetPackage "7-Zip" -Require64Bit
-        if ($has64Bit -eq 1) {
-            Write-Host "64-bit version is available"
-        }
-        
-        Checks specifically for 64-bit availability.
+        Returns 1 only if PuTTY by Simon Tatham is found.
 
     .NOTES
-        Author: Ringo
-        Version: 1.3.0
-        
-        This function uses the winget.run API which is a third-party service.
-        It does not require WinGet to be installed locally.
-        
-        Caching: API responses are cached for the session to minimize redundant
-        calls. Use Clear-WinGetCache to reset the cache if needed.
-        
-        Smart Matching: When multiple packages match, the function scores results
-        based on name similarity, publisher match, and package ID patterns to
-        return the most relevant match.
-        
-        API Rate Limiting: The winget.run API may have rate limits. For bulk
-        operations, consider adding delays between requests.
-
-    .LINK
-        https://winget.run
-
-    .LINK
-        https://docs.microsoft.com/en-us/windows/package-manager/winget/
+        Author: Mark Ringo
+        Version: 2.0.0
     #>
-
     [CmdletBinding()]
-    [OutputType([System.Int32])]
+    [OutputType([int])]
     param(
-        [Parameter(
-            Mandatory = $true,
-            Position = 0,
-            ValueFromPipeline = $true,
-            ValueFromPipelineByPropertyName = $true,
-            HelpMessage = "The display name of the application to search for."
-        )]
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [ValidateNotNullOrEmpty()]
         [Alias('Name', 'ApplicationName', 'AppName')]
         [string]$DisplayName,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Publisher name to filter results for precise matching."
-        )]
+        [Parameter()]
         [Alias('Vendor', 'Author')]
         [string]$Publisher,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Exact WinGet package ID for direct matching."
-        )]
+        [Parameter()]
         [Alias('Id', 'WinGetId')]
         [string]$PackageId,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Only return 1 if a 64-bit version is available."
-        )]
+        [Parameter()]
         [switch]$Require64Bit,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Timeout in seconds for the API request."
-        )]
+        [Parameter()]
         [ValidateRange(5, 300)]
         [int]$TimeoutSeconds = $Script:DefaultTimeout
     )
 
     begin {
         Write-Verbose "Starting WinGet package lookup..."
-        if ($Require64Bit) {
-            Write-Verbose "64-bit version requirement enabled"
-        }
-        if ($Publisher) {
-            Write-Verbose "Publisher filter: $Publisher"
-        }
-        if ($PackageId) {
-            Write-Verbose "Package ID filter: $PackageId"
-        }
     }
 
     process {
         Write-Verbose "Searching for package: $DisplayName"
         
         try {
-            # Use cached API response or make new call
-            $packages = Get-CachedApiResponse -SearchTerm $DisplayName -TimeoutSeconds $TimeoutSeconds
+            # Get packages with all filters
+            $packages = Get-CachedApiResponse -SearchTerm $DisplayName -Publisher $Publisher -PackageId $PackageId -TimeoutSeconds $TimeoutSeconds
             
             if (-not $packages -or $packages.Count -eq 0) {
-                Write-Verbose "Package not found: $DisplayName"
+                Write-Verbose "No packages found for: $DisplayName"
                 return 0
             }
             
-            # Use smart matching to find best package
+            # Find best match
             $bestMatch = Get-BestPackageMatch -Packages $packages -SearchTerm $DisplayName -Publisher $Publisher -PackageId $PackageId
             
             if (-not $bestMatch) {
@@ -710,36 +1028,37 @@ function Test-WinGetPackage {
             $matchedName = if ($bestMatch.Latest) { $bestMatch.Latest.Name } else { $bestMatch.Name }
             Write-Verbose "Best match: $matchedName ($matchedId)"
             
-            # If 64-bit is required, check for 64-bit indicators
+            # Check 64-bit requirement using manifest data
             if ($Require64Bit) {
-                $pkgTags = if ($bestMatch.Latest -and $bestMatch.Latest.Tags) { $bestMatch.Latest.Tags } else { @() }
-                $has64Bit = Test-64BitIndicators -PackageId $matchedId -PackageName $matchedName -Tags $pkgTags
+                $metadata = Get-InstallerMetadata -Package $bestMatch
                 
-                if ($has64Bit) {
-                    Write-Verbose "64-bit version confirmed for: $matchedName"
+                if ($metadata.Has64Bit -or $metadata.HasArm64) {
+                    Write-Verbose "64-bit installer available for: $matchedName (Architectures: $($metadata.Architectures -join ', '))"
                     return 1
-                } else {
-                    Write-Verbose "No 64-bit version found for: $matchedName"
-                    return 0
                 }
+                
+                # Fallback: fetch full manifest if installer data not in search results
+                $has64Bit = Test-64BitFromManifest -PackageId $matchedId -TimeoutSeconds $TimeoutSeconds
+                if ($has64Bit) {
+                    Write-Verbose "64-bit installer confirmed via manifest for: $matchedName"
+                    return 1
+                }
+                
+                Write-Verbose "No 64-bit installer found for: $matchedName"
+                return 0
             }
             
             return 1
         }
-        catch [System.Net.WebException] {
-            Write-Verbose "Network error while searching for $DisplayName : $($_.Exception.Message)"
-            Write-Warning "Network error occurred while querying WinGet API for '$DisplayName'"
-            return 0
-        }
         catch {
             Write-Verbose "Error searching for $DisplayName : $($_.Exception.Message)"
-            Write-Warning "Error occurred while querying WinGet API: $($_.Exception.Message)"
+            Write-Warning "Error querying WinGet API: $($_.Exception.Message)"
             return 0
         }
     }
 
     end {
-        Write-Verbose "WinGet package lookup completed."
+        Write-Verbose "Package lookup completed."
     }
 }
 
@@ -749,151 +1068,138 @@ function Get-WinGetPackageInfo {
         Retrieves detailed information about a WinGet package.
 
     .DESCRIPTION
-        Queries the winget.run API to retrieve detailed information about a package
-        including its WinGet ID, publisher, description, available versions, and more.
+        Queries the winget.run API to retrieve comprehensive package information
+        including ID, publisher, versions, and installer metadata.
         
-        Uses smart matching to find the best package match when multiple results
-        are returned. Supports filtering by publisher for precise matching.
+        Returns actual architecture, installer type, and scope data from
+        the package manifest - not heuristic-based guesses.
 
     .PARAMETER DisplayName
         The display name of the application to search for.
 
     .PARAMETER Publisher
-        Optional publisher name to filter results for more precise matching.
-        Useful when multiple packages share similar names.
+        Optional publisher name to filter results.
 
     .PARAMETER PackageId
         Optional exact WinGet package ID for direct matching.
-        When specified, only the package with this exact ID will be returned.
 
     .PARAMETER TimeoutSeconds
-        The timeout in seconds for the API request.
-        Default is 30 seconds.
+        The timeout in seconds for the API request. Default is 30.
 
     .OUTPUTS
-        PSCustomObject
-        Returns an object with package details if found, or $null if not found.
+        PSCustomObject with properties:
+        - Id: WinGet package identifier
+        - Name: Display name
+        - Publisher: Publisher name
+        - Description: Package description
+        - Homepage: Publisher/product URL
+        - License: License type
+        - Tags: Comma-separated tags
+        - Versions: Available versions
+        - LatestVersion: The latest available version
+        - Architectures: Available architectures (x86, x64, arm, arm64)
+        - InstallerTypes: Available installer types (msi, exe, msix, etc.)
+        - AvailableScopes: Installation scopes (user, machine)
+        - Has64BitInstaller: Boolean indicating x64/arm64 availability
+        - Found: Boolean indicating if package was found
 
     .EXAMPLE
-        Get-WinGetPackageInfo -DisplayName "Notepad++"
-        
-        Returns detailed information about the Notepad++ package.
+        Get-WinGetPackageInfo -DisplayName "7-Zip"
+        Returns full package details including architecture info.
 
     .EXAMPLE
-        Get-WinGetPackageInfo "7-Zip" | Select-Object Id, Name, Publisher
-        
-        Gets 7-Zip info and displays specific properties.
-
-    .EXAMPLE
-        Get-WinGetPackageInfo -DisplayName "PuTTY" -Publisher "Simon Tatham"
-        
-        Returns info for PuTTY by Simon Tatham specifically.
-
-    .EXAMPLE
-        Get-WinGetPackageInfo -DisplayName "PuTTY" -PackageId "PuTTY.PuTTY"
-        
-        Returns info for the exact package ID "PuTTY.PuTTY".
+        Get-WinGetPackageInfo "Notepad++" | Select-Object Id, Architectures, InstallerTypes
+        Shows architecture and installer type availability.
 
     .NOTES
-        Author: Ringo
-        Version: 1.3.0
-
-    .LINK
-        https://winget.run
+        Author: Mark Ringo
+        Version: 2.0.0
     #>
-
     [CmdletBinding()]
     [OutputType([PSCustomObject])]
     param(
-        [Parameter(
-            Mandatory = $true,
-            Position = 0,
-            ValueFromPipeline = $true,
-            ValueFromPipelineByPropertyName = $true,
-            HelpMessage = "The display name of the application to search for."
-        )]
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [ValidateNotNullOrEmpty()]
         [Alias('Name', 'ApplicationName', 'AppName')]
         [string]$DisplayName,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Publisher name to filter results for precise matching."
-        )]
+        [Parameter()]
         [Alias('Vendor', 'Author')]
         [string]$Publisher,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Exact WinGet package ID for direct matching."
-        )]
+        [Parameter()]
         [Alias('Id', 'WinGetId')]
         [string]$PackageId,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Timeout in seconds for the API request."
-        )]
+        [Parameter()]
         [ValidateRange(5, 300)]
         [int]$TimeoutSeconds = $Script:DefaultTimeout
     )
 
     begin {
         Write-Verbose "Starting WinGet package info lookup..."
-        if ($Publisher) {
-            Write-Verbose "Publisher filter: $Publisher"
-        }
-        if ($PackageId) {
-            Write-Verbose "Package ID filter: $PackageId"
-        }
     }
 
     process {
         Write-Verbose "Searching for package info: $DisplayName"
         
+        # Default "not found" response
+        $notFoundResult = [PSCustomObject]@{
+            Id               = $null
+            Name             = $DisplayName
+            Publisher        = $null
+            Description      = $null
+            Homepage         = $null
+            License          = $null
+            Tags             = $null
+            Versions         = $null
+            LatestVersion    = $null
+            Architectures    = $null
+            InstallerTypes   = $null
+            AvailableScopes  = $null
+            Has64BitInstaller = $false
+            Found            = $false
+        }
+        
         try {
-            # Use cached API response or make new call
-            $packages = Get-CachedApiResponse -SearchTerm $DisplayName -TimeoutSeconds $TimeoutSeconds
+            $packages = Get-CachedApiResponse -SearchTerm $DisplayName -Publisher $Publisher -PackageId $PackageId -TimeoutSeconds $TimeoutSeconds
             
             if (-not $packages -or $packages.Count -eq 0) {
                 Write-Verbose "Package not found: $DisplayName"
-                return [PSCustomObject]@{
-                    Id                = $null
-                    Name              = $DisplayName
-                    Publisher         = $null
-                    Description       = $null
-                    Homepage          = $null
-                    License           = $null
-                    Tags              = $null
-                    Versions          = $null
-                    Has64BitIndicator = $false
-                    Found             = $false
-                }
+                return $notFoundResult
             }
             
-            # Use smart matching to find best package
             $bestMatch = Get-BestPackageMatch -Packages $packages -SearchTerm $DisplayName -Publisher $Publisher -PackageId $PackageId
             
             if (-not $bestMatch) {
                 Write-Verbose "No matching package found for: $DisplayName"
-                return [PSCustomObject]@{
-                    Id                = $null
-                    Name              = $DisplayName
-                    Publisher         = $null
-                    Description       = $null
-                    Homepage          = $null
-                    License           = $null
-                    Tags              = $null
-                    Versions          = $null
-                    Has64BitIndicator = $false
-                    Found             = $false
-                }
+                return $notFoundResult
             }
             
             $latest = $bestMatch.Latest
             
-            # Check for 64-bit indicators in package metadata
-            $has64Bit = Test-64BitIndicators -PackageId $bestMatch.Id -PackageName $latest.Name -Tags $latest.Tags
+            # Get installer metadata
+            $metadata = Get-InstallerMetadata -Package $bestMatch
+            
+            # If no installer metadata in search results, try fetching full manifest
+            if ($metadata.Architectures.Count -eq 0 -and $bestMatch.Id) {
+                Write-Verbose "Fetching full manifest for complete installer data..."
+                $fullManifest = Get-PackageManifestDetails -PackageId $bestMatch.Id -TimeoutSeconds $TimeoutSeconds
+                if ($fullManifest) {
+                    $metadata = Get-InstallerMetadata -Package $fullManifest
+                }
+            }
+            
+            # Get versions and determine latest
+            $versions = @()
+            if ($bestMatch.Versions) {
+                $versions = $bestMatch.Versions
+            }
+            $latestVersion = if ($versions.Count -gt 0) { 
+                Get-WinGetLatestVersion -Versions $versions 
+            } else { 
+                $null 
+            }
             
             $result = [PSCustomObject]@{
                 Id                = $bestMatch.Id
@@ -903,8 +1209,12 @@ function Get-WinGetPackageInfo {
                 Homepage          = $latest.Homepage
                 License           = $latest.License
                 Tags              = if ($latest.Tags) { $latest.Tags -join ', ' } else { $null }
-                Versions          = if ($bestMatch.Versions) { $bestMatch.Versions -join ', ' } else { $null }
-                Has64BitIndicator = $has64Bit
+                Versions          = if ($versions) { $versions -join ', ' } else { $null }
+                LatestVersion     = $latestVersion
+                Architectures     = if ($metadata.Architectures) { $metadata.Architectures -join ', ' } else { $null }
+                InstallerTypes    = if ($metadata.InstallerTypes) { $metadata.InstallerTypes -join ', ' } else { $null }
+                AvailableScopes   = if ($metadata.Scopes) { $metadata.Scopes -join ', ' } else { 'machine' }
+                Has64BitInstaller = ($metadata.Has64Bit -or $metadata.HasArm64)
                 Found             = $true
             }
             
@@ -913,189 +1223,75 @@ function Get-WinGetPackageInfo {
         }
         catch {
             Write-Verbose "Error searching for $DisplayName : $($_.Exception.Message)"
-            Write-Warning "Error occurred while querying WinGet API: $($_.Exception.Message)"
+            Write-Warning "Error querying WinGet API: $($_.Exception.Message)"
             return $null
         }
     }
 
     end {
-        Write-Verbose "WinGet package info lookup completed."
+        Write-Verbose "Package info lookup completed."
     }
 }
+#endregion
 
-function Clear-WinGetCache {
-    <#
-    .SYNOPSIS
-        Clears the session-level WinGet API cache.
-
-    .DESCRIPTION
-        Clears all cached API responses and resets cache statistics.
-        Use this if you need fresh data from the API or to free memory.
-
-    .EXAMPLE
-        Clear-WinGetCache
-        
-        Clears all cached WinGet package data.
-
-    .EXAMPLE
-        Clear-WinGetCache -Verbose
-        
-        Clears cache and shows how many entries were removed.
-
-    .NOTES
-        Author: Ringo
-        Version: 1.3.0
-    #>
-    [CmdletBinding()]
-    param()
-    
-    $entryCount = $Script:PackageCache.Count
-    $Script:PackageCache.Clear()
-    $Script:CacheHits = 0
-    $Script:CacheMisses = 0
-    
-    Write-Verbose "Cleared $entryCount cached entries and reset statistics"
-}
-
-function Get-WinGetCacheStatistics {
-    <#
-    .SYNOPSIS
-        Returns cache statistics for the current session.
-
-    .DESCRIPTION
-        Returns information about cache hits, misses, and efficiency
-        to help understand API call reduction.
-
-    .OUTPUTS
-        PSCustomObject with cache statistics.
-
-    .EXAMPLE
-        Get-WinGetCacheStatistics
-        
-        Returns cache hit/miss counts and efficiency percentage.
-
-    .EXAMPLE
-        # After running multiple queries
-        Get-WinGetCacheStatistics | Format-List
-        
-        Shows detailed cache performance.
-
-    .NOTES
-        Author: Ringo
-        Version: 1.3.0
-    #>
-    [CmdletBinding()]
-    [OutputType([PSCustomObject])]
-    param()
-    
-    $totalRequests = $Script:CacheHits + $Script:CacheMisses
-    $efficiency = if ($totalRequests -gt 0) { 
-        [math]::Round(($Script:CacheHits / $totalRequests) * 100, 2) 
-    } else { 
-        0 
-    }
-    
-    [PSCustomObject]@{
-        CachedEntries    = $Script:PackageCache.Count
-        CacheHits        = $Script:CacheHits
-        CacheMisses      = $Script:CacheMisses
-        TotalRequests    = $totalRequests
-        EfficiencyPct    = $efficiency
-        ApiCallsSaved    = $Script:CacheHits
-    }
-}
+#region Public Functions - CLI-Based Operations
 
 function Test-WinGet64BitAvailable {
     <#
     .SYNOPSIS
-        Tests if a WinGet package has a 64-bit installer available using the local WinGet CLI.
+        Tests if a WinGet package has a 64-bit installer using the local WinGet CLI.
 
     .DESCRIPTION
         Uses the local WinGet command-line tool to definitively check if a package
-        has an x64 architecture installer available. This is more accurate than
-        heuristic-based detection as it queries the actual package manifest.
+        has an x64 architecture installer available. This queries the actual
+        package manifest via the CLI.
         
-        Note: This function requires WinGet to be installed locally.
+        Note: Requires WinGet CLI to be installed locally.
 
     .PARAMETER PackageId
-        The WinGet package ID to check (e.g., "RARLab.WinRAR", "7zip.7zip").
+        The WinGet package ID to check.
 
     .PARAMETER TimeoutSeconds
-        Maximum time to wait for the WinGet command to complete.
-        Default is 30 seconds.
+        Maximum time to wait for the WinGet command. Default is 30.
 
     .OUTPUTS
         System.Boolean
-        Returns $true if the package has an x64 installer available, $false otherwise.
+        Returns $true if x64 installer is available, $false otherwise.
 
     .EXAMPLE
         Test-WinGet64BitAvailable -PackageId "RARLab.WinRAR"
-        
-        Returns $true because WinRAR has an x64 installer.
-
-    .EXAMPLE
-        Test-WinGet64BitAvailable -PackageId "Adobe.Acrobat.Reader.32-bit"
-        
-        Returns $false because this package only has x86 installers.
-
-    .EXAMPLE
-        # Use with Get-WinGetPackageInfo for complete package analysis
-        $pkg = Get-WinGetPackageInfo -DisplayName "WinRAR"
-        if ($pkg.Found) {
-            $has64 = Test-WinGet64BitAvailable -PackageId $pkg.Id
-            Write-Host "$($pkg.Name): 64-bit available = $has64"
-        }
+        Returns $true if WinRAR has an x64 installer.
 
     .NOTES
-        Author: Ringo
-        Version: 1.5.0
-        
-        This function requires WinGet (winget.exe) to be installed and accessible.
-        Unlike other functions in this module that use the winget.run API,
-        this function queries the local WinGet installation directly for
-        accurate architecture information.
+        Author: Mark Ringo
+        Version: 2.0.0
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [Parameter(
-            Mandatory = $true,
-            Position = 0,
-            ValueFromPipeline = $true,
-            ValueFromPipelineByPropertyName = $true,
-            HelpMessage = "The WinGet package ID to check for 64-bit availability."
-        )]
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [ValidateNotNullOrEmpty()]
         [Alias('Id', 'WinGetId')]
         [string]$PackageId,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Timeout in seconds for the WinGet command."
-        )]
+        [Parameter()]
         [ValidateRange(5, 300)]
         [int]$TimeoutSeconds = 30
     )
 
     begin {
-        Write-Verbose "Checking 64-bit availability via WinGet CLI..."
-        
         if (-not $Script:WinGetCliAvailable) {
-            Write-Warning "WinGet (winget.exe) not found. Cannot verify 64-bit availability via CLI."
-        } else {
-            Write-Verbose "Using cached WinGet path: $($Script:WinGetCliPath)"
+            Write-Warning "WinGet CLI not found. Cannot verify 64-bit availability via CLI."
         }
     }
 
     process {
         if (-not $Script:WinGetCliAvailable) {
-            Write-Verbose "WinGet CLI not available, returning false for: $PackageId"
             return $false
         }
 
-        Write-Verbose "Checking x64 availability for: $PackageId"
+        Write-Verbose "Checking x64 availability via CLI for: $PackageId"
         
-        # Build arguments for winget show with x64 architecture
         $arguments = @(
             'show',
             '--id', $PackageId,
@@ -1114,108 +1310,78 @@ function Test-WinGet64BitAvailable {
         $output = $result.StdOut
         $exitCode = $result.ExitCode
         
-        # Check if package was found and has a valid installer
-        # Exit code 0 with "Found" indicates package exists
-        # Must also have installer info but NOT "No applicable installer found"
         if ($exitCode -eq 0 -and $output -match 'Found.*\[') {
-            # Check for "No applicable installer found" which means no x64 installer exists
             if ($output -match 'No applicable installer found') {
-                Write-Verbose "Package found but no x64 installer available for: $PackageId"
+                Write-Verbose "Package found but no x64 installer: $PackageId"
                 return $false
             }
             
-            # Check for valid installer information (Installer URL or Type)
             if ($output -match 'Installer Url:|Installer Type:') {
-                Write-Verbose "64-bit version available for: $PackageId"
+                Write-Verbose "64-bit version available: $PackageId"
                 return $true
             }
         }
         
-        Write-Verbose "No 64-bit version found for: $PackageId (Exit code: $exitCode)"
+        Write-Verbose "No 64-bit version found: $PackageId"
         return $false
-    }
-
-    end {
-        Write-Verbose "64-bit availability check completed."
     }
 }
 
 function Get-WinGet64BitPackageId {
     <#
     .SYNOPSIS
-        Gets the 64-bit package ID for an application, handling both same-package and separate-package scenarios.
+        Gets the 64-bit package ID for an application.
 
     .DESCRIPTION
-        Some applications have both 32-bit and 64-bit installers in the same WinGet package (e.g., 7-Zip, WinRAR).
-        Other applications have separate packages for each architecture (e.g., Adobe.Acrobat.Reader.32-bit vs .64-bit).
-        
-        This function handles both scenarios:
-        1. If the package has an x64 installer, returns the same package ID
-        2. If the package ID contains ".32-bit" or "-32-bit", checks for a ".64-bit" variant
-        3. Returns the appropriate 64-bit package ID, or $null if none available
+        Handles both scenarios:
+        1. Package has x64 installer in same package (returns same ID)
+        2. Package has separate 32/64-bit packages (returns 64-bit variant ID)
 
     .PARAMETER PackageId
-        The WinGet package ID to check (e.g., "Adobe.Acrobat.Reader.32-bit", "7zip.7zip").
+        The WinGet package ID to check.
 
     .PARAMETER TimeoutSeconds
-        Maximum time to wait for WinGet commands.
-        Default is 30 seconds.
+        Maximum time for WinGet commands. Default is 30.
 
     .OUTPUTS
         System.String
-        Returns the package ID that provides 64-bit installation, or $null if none available.
+        Returns package ID that provides 64-bit installation, or $null.
 
     .EXAMPLE
         Get-WinGet64BitPackageId -PackageId "Adobe.Acrobat.Reader.32-bit"
-        
-        Returns "Adobe.Acrobat.Reader.64-bit" because a separate 64-bit package exists.
+        Returns "Adobe.Acrobat.Reader.64-bit"
 
     .EXAMPLE
         Get-WinGet64BitPackageId -PackageId "7zip.7zip"
-        
-        Returns "7zip.7zip" because the same package has an x64 installer.
-
-    .EXAMPLE
-        Get-WinGet64BitPackageId -PackageId "SomeApp.OnlyX86"
-        
-        Returns $null if no 64-bit version is available.
+        Returns "7zip.7zip" (same package has x64)
 
     .NOTES
-        Author: Ringo
-        Version: 1.5.0
+        Author: Mark Ringo
+        Version: 2.0.0
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
-        [Parameter(
-            Mandatory = $true,
-            Position = 0,
-            ValueFromPipeline = $true,
-            ValueFromPipelineByPropertyName = $true,
-            HelpMessage = "The WinGet package ID to check."
-        )]
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
         [ValidateNotNullOrEmpty()]
         [Alias('Id', 'WinGetId')]
         [string]$PackageId,
 
-        [Parameter(
-            Mandatory = $false,
-            HelpMessage = "Timeout in seconds for WinGet commands."
-        )]
+        [Parameter()]
         [ValidateRange(5, 300)]
         [int]$TimeoutSeconds = 30
     )
 
     process {
-        Write-Verbose "Checking for 64-bit package variant of: $PackageId"
+        Write-Verbose "Checking for 64-bit package: $PackageId"
         
-        # First, check if the current package has an x64 installer
+        # First check if current package has x64
         if (Test-WinGet64BitAvailable -PackageId $PackageId -TimeoutSeconds $TimeoutSeconds) {
-            Write-Verbose "Package $PackageId has x64 installer available"
+            Write-Verbose "Package $PackageId has x64 installer"
             return $PackageId
         }
         
-        # Check if this is a 32-bit specific package that might have a 64-bit variant
+        # Check for 64-bit variant package
         $potential64BitId = $null
         
         if ($PackageId -match '\.32-bit$') {
@@ -1231,16 +1397,13 @@ function Get-WinGet64BitPackageId {
             $potential64BitId = $PackageId -replace '-x86$', '-x64'
         }
         elseif ($PackageId -match '32$') {
-            # Handle cases like "SomeApp32" -> "SomeApp64"
             $potential64BitId = $PackageId -replace '32$', '64'
         }
         
         if ($potential64BitId) {
-            Write-Verbose "Checking for 64-bit variant package: $potential64BitId"
-            
-            # Verify the 64-bit variant package exists and has an x64 installer
+            Write-Verbose "Checking 64-bit variant: $potential64BitId"
             if (Test-WinGet64BitAvailable -PackageId $potential64BitId -TimeoutSeconds $TimeoutSeconds) {
-                Write-Verbose "Found 64-bit variant package: $potential64BitId"
+                Write-Verbose "Found 64-bit variant: $potential64BitId"
                 return $potential64BitId
             }
         }
@@ -1250,47 +1413,249 @@ function Get-WinGet64BitPackageId {
     }
 }
 
+function Find-WinGetPackageByProductCode {
+    <#
+    .SYNOPSIS
+        Finds a WinGet package by MSI ProductCode GUID.
+
+    .DESCRIPTION
+        Searches for a WinGet package using an MSI ProductCode.
+        This is useful for correlating installed applications (from registry)
+        with WinGet packages for upgrade scenarios.
+        
+        Requires WinGet CLI to be installed locally.
+
+    .PARAMETER ProductCode
+        The MSI ProductCode GUID to search for.
+        Can include or exclude curly braces.
+
+    .PARAMETER TimeoutSeconds
+        Maximum time for the WinGet command. Default is 30.
+
+    .OUTPUTS
+        PSCustomObject with package details, or $null if not found.
+
+    .EXAMPLE
+        Find-WinGetPackageByProductCode -ProductCode "{AC76BA86-7AD7-1033-7B44-AC0F074E4100}"
+        Searches for Adobe Acrobat Reader by its ProductCode.
+
+    .EXAMPLE
+        $installed = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        $installed | Where-Object { $_.PSChildName -match '^\{' } | ForEach-Object {
+            Find-WinGetPackageByProductCode -ProductCode $_.PSChildName
+        }
+        Searches WinGet for all installed MSI products.
+
+    .NOTES
+        Author: Mark Ringo
+        Version: 2.0.0
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [ValidateNotNullOrEmpty()]
+        [Alias('GUID', 'MSIProductCode')]
+        [string]$ProductCode,
+
+        [Parameter()]
+        [ValidateRange(5, 300)]
+        [int]$TimeoutSeconds = 30
+    )
+
+    begin {
+        if (-not $Script:WinGetCliAvailable) {
+            Write-Warning "WinGet CLI not found. ProductCode search requires WinGet CLI."
+        }
+    }
+
+    process {
+        if (-not $Script:WinGetCliAvailable) {
+            return $null
+        }
+
+        # Normalize ProductCode (ensure curly braces)
+        $normalizedCode = $ProductCode.Trim()
+        if ($normalizedCode -notmatch '^\{') {
+            $normalizedCode = "{$normalizedCode"
+        }
+        if ($normalizedCode -notmatch '\}$') {
+            $normalizedCode = "$normalizedCode}"
+        }
+
+        Write-Verbose "Searching for ProductCode: $normalizedCode"
+        
+        $arguments = @(
+            'search',
+            '--product-code', $normalizedCode,
+            '--accept-source-agreements',
+            '--disable-interactivity'
+        )
+        
+        $result = Invoke-WinGetCliCommand -Arguments $arguments -TimeoutSeconds $TimeoutSeconds
+        
+        if (-not $result.Success) {
+            Write-Verbose "WinGet search failed: $($result.StdErr)"
+            return $null
+        }
+        
+        $output = $result.StdOut
+        
+        # Parse WinGet CLI output
+        # Format is typically: Name  Id  Version  Source
+        $lines = $output -split "`n" | Where-Object { $_.Trim() -ne '' }
+        
+        # Find the data line (skip header and separator)
+        $dataLine = $null
+        $foundHeader = $false
+        foreach ($line in $lines) {
+            if ($line -match '^-+') {
+                $foundHeader = $true
+                continue
+            }
+            if ($foundHeader -and $line -match '\S') {
+                $dataLine = $line
+                break
+            }
+        }
+        
+        if (-not $dataLine) {
+            Write-Verbose "No package found for ProductCode: $normalizedCode"
+            return $null
+        }
+        
+        # Parse the data line (columns are space-separated, variable width)
+        # This is fragile but WinGet doesn't offer JSON output for search
+        $parts = $dataLine -split '\s{2,}'
+        
+        if ($parts.Count -ge 3) {
+            $result = [PSCustomObject]@{
+                Name        = $parts[0].Trim()
+                Id          = $parts[1].Trim()
+                Version     = $parts[2].Trim()
+                Source      = if ($parts.Count -ge 4) { $parts[3].Trim() } else { 'winget' }
+                ProductCode = $normalizedCode
+            }
+            
+            Write-Verbose "Found package: $($result.Name) ($($result.Id))"
+            return $result
+        }
+        
+        return $null
+    }
+}
+#endregion
+
+#region Public Functions - Cache Management
+
+function Clear-WinGetCache {
+    <#
+    .SYNOPSIS
+        Clears the session-level WinGet API cache.
+
+    .DESCRIPTION
+        Clears all cached API responses (package searches and manifest data)
+        and resets cache statistics.
+
+    .EXAMPLE
+        Clear-WinGetCache
+        Clears all cached data.
+
+    .NOTES
+        Author: Mark Ringo
+        Version: 2.0.0
+    #>
+    [CmdletBinding()]
+    param()
+    
+    $packageCount = $Script:PackageCache.Count
+    $manifestCount = $Script:ManifestCache.Count
+    
+    $Script:PackageCache.Clear()
+    $Script:ManifestCache.Clear()
+    $Script:CacheHits = 0
+    $Script:CacheMisses = 0
+    
+    Write-Verbose "Cleared $packageCount package cache entries and $manifestCount manifest cache entries"
+}
+
+function Get-WinGetCacheStatistics {
+    <#
+    .SYNOPSIS
+        Returns cache statistics for the current session.
+
+    .DESCRIPTION
+        Returns information about cache performance including hits, misses,
+        and efficiency percentage.
+
+    .OUTPUTS
+        PSCustomObject with cache statistics.
+
+    .EXAMPLE
+        Get-WinGetCacheStatistics
+
+    .NOTES
+        Author: Mark Ringo
+        Version: 2.0.0
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param()
+    
+    $totalRequests = $Script:CacheHits + $Script:CacheMisses
+    $efficiency = if ($totalRequests -gt 0) { 
+        [math]::Round(($Script:CacheHits / $totalRequests) * 100, 2) 
+    } else { 
+        0 
+    }
+    
+    [PSCustomObject]@{
+        PackageCacheEntries  = $Script:PackageCache.Count
+        ManifestCacheEntries = $Script:ManifestCache.Count
+        CacheHits            = $Script:CacheHits
+        CacheMisses          = $Script:CacheMisses
+        TotalRequests        = $totalRequests
+        EfficiencyPct        = $efficiency
+        ApiCallsSaved        = $Script:CacheHits
+    }
+}
+
 function Initialize-WinGetPackageCache {
     <#
     .SYNOPSIS
-        Pre-fetches package information for multiple applications to warm the cache.
+        Pre-fetches package information for multiple applications.
 
     .DESCRIPTION
-        Improvement #3: Batch API lookups
         Makes API calls for all provided search terms to pre-populate the cache.
-        Subsequent calls to Get-WinGetPackageInfo or Test-WinGetPackage will use cached data.
-        
-        This is more efficient than making individual calls when processing many applications.
+        Includes throttling to avoid API rate limits.
 
     .PARAMETER SearchTerms
-        Array of application names to pre-fetch from the WinGet API.
+        Array of application names to pre-fetch.
+
+    .PARAMETER Publisher
+        Optional publisher filter to apply to all searches.
 
     .PARAMETER TimeoutSeconds
-        Timeout in seconds for each API request. Default is 30.
+        Timeout per API request. Default is 30.
 
     .PARAMETER ThrottleDelayMs
-        Milliseconds to wait between API calls to avoid rate limiting. Default is 100.
+        Milliseconds between API calls. Default is 100.
 
     .EXAMPLE
-        $apps = @("7-Zip", "Notepad++", "VLC", "WinRAR")
-        Initialize-WinGetPackageCache -SearchTerms $apps
-        
-        Pre-fetches all packages, then subsequent lookups are instant.
-
-    .EXAMPLE
-        $installed = Get-Installed32BitApplications
-        Initialize-WinGetPackageCache -SearchTerms ($installed.DisplayName)
-        
-        Pre-warms cache with all installed application names.
+        Initialize-WinGetPackageCache -SearchTerms @("7-Zip", "Notepad++", "VLC")
+        Pre-fetches multiple packages.
 
     .NOTES
-        Author: Ringo
-        Version: 1.7.0
+        Author: Mark Ringo
+        Version: 2.0.0
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
         [string[]]$SearchTerms,
+
+        [Parameter()]
+        [string]$Publisher,
 
         [Parameter()]
         [ValidateRange(5, 300)]
@@ -1310,18 +1675,21 @@ function Initialize-WinGetPackageCache {
     }
 
     end {
-        # Deduplicate and normalize search terms
+        # Get unique terms not already cached
         $uniqueTerms = $allTerms | 
-            ForEach-Object { $_.ToLowerInvariant().Trim() } | 
+            ForEach-Object { $_.Trim() } | 
             Select-Object -Unique |
-            Where-Object { -not $Script:PackageCache.ContainsKey($_) }  # Skip already cached
+            Where-Object { 
+                $cacheKey = Get-CacheKey -SearchTerm $_ -Publisher $Publisher -PackageId ''
+                -not $Script:PackageCache.ContainsKey($cacheKey)
+            }
 
         if ($uniqueTerms.Count -eq 0) {
-            Write-Verbose "All search terms already cached, nothing to prefetch"
+            Write-Verbose "All search terms already cached"
             return
         }
 
-        Write-Verbose "Pre-fetching $($uniqueTerms.Count) packages to cache..."
+        Write-Verbose "Pre-fetching $($uniqueTerms.Count) packages..."
         $fetched = 0
         $total = $uniqueTerms.Count
 
@@ -1329,30 +1697,37 @@ function Initialize-WinGetPackageCache {
             $fetched++
             Write-Progress -Activity "Pre-fetching WinGet packages" -Status "$fetched of $total - $term" -PercentComplete (($fetched / $total) * 100)
             
-            # This will cache the result
-            $null = Get-CachedApiResponse -SearchTerm $term -TimeoutSeconds $TimeoutSeconds
+            $null = Get-CachedApiResponse -SearchTerm $term -Publisher $Publisher -TimeoutSeconds $TimeoutSeconds
             
-            # Throttle to avoid rate limiting
             if ($ThrottleDelayMs -gt 0 -and $fetched -lt $total) {
                 Start-Sleep -Milliseconds $ThrottleDelayMs
             }
         }
 
         Write-Progress -Activity "Pre-fetching WinGet packages" -Completed
-        Write-Verbose "Pre-fetch complete. Cache now contains $($Script:PackageCache.Count) entries."
+        Write-Verbose "Pre-fetch complete. Cache: $($Script:PackageCache.Count) packages, $($Script:ManifestCache.Count) manifests"
     }
 }
-
 #endregion
 
 #region Module Exports
 Export-ModuleMember -Function @(
+    # Package lookup
     'Test-WinGetPackage',
     'Get-WinGetPackageInfo',
-    'Clear-WinGetCache',
-    'Get-WinGetCacheStatistics',
+    
+    # Version utilities
+    'Compare-WinGetVersion',
+    'Get-WinGetLatestVersion',
+    
+    # CLI-based operations
     'Test-WinGet64BitAvailable',
     'Get-WinGet64BitPackageId',
+    'Find-WinGetPackageByProductCode',
+    
+    # Cache management
+    'Clear-WinGetCache',
+    'Get-WinGetCacheStatistics',
     'Initialize-WinGetPackageCache'
 )
 #endregion

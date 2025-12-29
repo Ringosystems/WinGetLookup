@@ -1,4 +1,4 @@
-﻿#
+#
 # Module manifest for module 'WinGetLookup'
 #
 # Generated on: 12/26/2025
@@ -9,7 +9,10 @@
     RootModule        = 'WinGetLookup.psm1'
 
     # Version number of this module
-    ModuleVersion     = '1.8.0'
+    ModuleVersion     = '2.0.0'
+
+    # Prerelease tag for alpha/beta releases
+    # Note: Prerelease is specified in PSData section below
 
     # Supported PSEditions
     CompatiblePSEditions = @('Desktop', 'Core')
@@ -27,7 +30,7 @@
     Copyright         = '(c) 2025 Mark Ringo. MIT License.'
 
     # Description of the functionality provided by this module
-    Description       = 'A PowerShell module to query the WinGet (Windows Package Manager) repository for package availability. Uses the winget.run API to check if applications exist in the WinGet repository without requiring WinGet to be installed locally.'
+    Description       = 'A PowerShell module to query the WinGet (Windows Package Manager) repository for package availability with high fidelity to WinGet''s internal operations. Uses the winget.run API to check package availability, retrieve actual installer metadata (architectures, installer types, scopes), compare versions, and correlate MSI ProductCodes - all without requiring WinGet to be installed locally.'
 
     # Minimum version of the PowerShell engine required by this module
     PowerShellVersion = '5.1'
@@ -52,12 +55,22 @@
 
     # Functions to export from this module
     FunctionsToExport = @(
+        # Package lookup
         'Test-WinGetPackage',
         'Get-WinGetPackageInfo',
-        'Clear-WinGetCache',
-        'Get-WinGetCacheStatistics',
+        
+        # Version utilities
+        'Compare-WinGetVersion',
+        'Get-WinGetLatestVersion',
+        
+        # CLI-based operations
         'Test-WinGet64BitAvailable',
         'Get-WinGet64BitPackageId',
+        'Find-WinGetPackageByProductCode',
+        
+        # Cache management
+        'Clear-WinGetCache',
+        'Get-WinGetCacheStatistics',
         'Initialize-WinGetPackageCache'
     )
 
@@ -95,7 +108,11 @@
                 'PackageLookup',
                 'Windows',
                 'Automation',
-                'DevOps'
+                'DevOps',
+                'Intune',
+                'SCCM',
+                'ConfigMgr',
+                'AppDeployment'
             )
 
             # A URL to the license for this module
@@ -108,8 +125,49 @@
             # Note: For PSGallery, this must be a publicly accessible HTTPS URL
             IconUri      = 'https://raw.githubusercontent.com/Ringosystems/WinGetLookup/master/icon.png'
 
+            # Prerelease tag (alpha, beta, rc, etc.)
+            Prerelease   = 'alpha1'
+
             # ReleaseNotes of this module
             ReleaseNotes = @'
+## Version 2.0.0-alpha1 (December 28, 2025)
+### Major Refactor for WinGet Schema Fidelity (ALPHA RELEASE)
+
+**⚠️ ALPHA RELEASE** - This is a pre-release version for testing. APIs may change before final 2.0.0 release.
+
+This release significantly improves accuracy by using actual WinGet manifest data instead of heuristics.
+
+### New Features
+- **True Architecture Detection**: Queries actual manifest `Installers` array for x86/x64/arm/arm64 data
+- **InstallerType Exposure**: Returns installer types (msi, exe, msix, inno, nullsoft, portable, etc.)
+- **Scope Detection**: Shows available installation scopes (user, machine)
+- **Version Comparison**: New `Compare-WinGetVersion` and `Get-WinGetLatestVersion` functions
+- **ProductCode Search**: New `Find-WinGetPackageByProductCode` for MSI correlation
+- **API Retry Logic**: Exponential backoff for transient failures (429, 5xx errors)
+- **Enhanced Caching**: Separate manifest cache, full parameter-aware cache keys
+
+### Improvements
+- API queries now use `preferContains` and `splitQuery` for better multi-word matching
+- Publisher filter applied at API level (server-side) for efficiency
+- Hybrid scoring uses API's SearchScore combined with client-side validation
+- `Get-WinGetPackageInfo` returns rich installer metadata
+
+### Breaking Changes
+- `Has64BitIndicator` property renamed to `Has64BitInstaller` (now boolean from manifest data)
+- Cache statistics now include `ManifestCacheEntries` count
+
+### New Exported Functions
+- `Compare-WinGetVersion` - Compare two WinGet-style version strings
+- `Get-WinGetLatestVersion` - Get highest version from array
+- `Find-WinGetPackageByProductCode` - Search by MSI ProductCode GUID
+
+### Enhanced Output Properties (Get-WinGetPackageInfo)
+- `Architectures` - Available architectures (x86, x64, arm, arm64)
+- `InstallerTypes` - Available installer types (msi, exe, msix, etc.)
+- `AvailableScopes` - Installation scopes (user, machine)
+- `LatestVersion` - Computed latest version from Versions array
+- `Has64BitInstaller` - Boolean from actual manifest data
+
 ## Version 1.8.0 (December 28, 2025)
 ### Bug Fixes
 - Fixed smart matching algorithm to prevent false positives
