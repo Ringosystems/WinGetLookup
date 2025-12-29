@@ -1,10 +1,10 @@
 # WinGetLookup
 
-[![PowerShell Gallery](https://img.shields.io/badge/PowerShell%20Gallery-v2.0.0--alpha1-orange)](https://www.powershellgallery.com/packages/WinGetLookup)
+[![PowerShell Gallery](https://img.shields.io/badge/PowerShell%20Gallery-v2.0.0-blue)](https://www.powershellgallery.com/packages/WinGetLookup)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-blue.svg)](https://docs.microsoft.com/powershell/)
+[![PowerShell 7.0+](https://img.shields.io/badge/PowerShell-7.0%2B-blue.svg)](https://docs.microsoft.com/powershell/)
 
-> ⚠️ **ALPHA RELEASE** - This is version 2.0.0-alpha1. APIs may change before the final 2.0.0 release.
+> ✅ **STABLE RELEASE** - Version 2.0.0 is production ready.
 
 A PowerShell module to query the WinGet (Windows Package Manager) repository with **high fidelity to WinGet's internal operations** — without requiring WinGet to be installed locally.
 
@@ -23,11 +23,9 @@ A PowerShell module to query the WinGet (Windows Package Manager) repository wit
 - 🏢 **Publisher Filtering** - Server-side publisher filtering for efficiency
 - 🔧 **Pipeline Support** - Full PowerShell pipeline integration throughout
 
-## What's New in v2.0.0-alpha1
+## What's New in v2.0.0
 
-> ⚠️ **ALPHA RELEASE** - This is a pre-release version for testing. Please report issues on GitHub.
-
-Version 2.0.0-alpha1 is a major refactor focused on **accuracy and completeness**:
+Version 2.0.0 is a major refactor focused on **accuracy and completeness**:
 
 | Feature | Before (v1.x) | After (v2.0) |
 |---------|---------------|--------------|
@@ -65,7 +63,7 @@ Import-Module WinGetLookup
 
 ## Requirements
 
-- **PowerShell 5.1** (Windows PowerShell) or **PowerShell 7+** (PowerShell Core)
+- **PowerShell 7.0+** (PowerShell Core) - **Required**
 - Internet connectivity for API access
 - No WinGet installation required for API-based functions
 
